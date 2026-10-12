@@ -1,5 +1,5 @@
 import React, { useState, useMemo } from 'react';
-import { Loader2, Calendar, CheckCircle, AlertCircle, Video, Instagram, Youtube, ChevronLeft, ChevronRight, Circle, ExternalLink } from 'lucide-react';
+import { Loader2, Calendar, CheckCircle, AlertCircle, Facebook, Video, Instagram, Youtube, ChevronLeft, ChevronRight, Circle } from 'lucide-react';
 import { apiFetch } from '../lib/api';
 import Modal from './ui/Modal';
 import SegmentedControl from './ui/SegmentedControl';
@@ -43,6 +43,7 @@ const TIMEZONES = [
 const PLATFORM_OPTIONS = [
     { value: 'tiktok', label: 'TikTok', icon: <Video size={16} /> },
     { value: 'instagram', label: 'Instagram', icon: <Instagram size={16} /> },
+    { value: 'facebook', label: 'Facebook Reels', icon: <Facebook size={16} /> },
     { value: 'youtube', label: 'YouTube', icon: <Youtube size={16} /> },
 ];
 
@@ -73,12 +74,13 @@ function detectTimezone() {
     }
 }
 
-export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, uploadPostKey, uploadUserId, isManaged }) {
+export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, uploadPostKey, uploadUserId, isManaged, socialReady = null, platformCapabilities = [] }) {
     const [time, setTime] = useState('12:00');
     const [timezone, setTimezone] = useState(detectTimezone);
     const [platforms, setPlatforms] = useState({
         tiktok: true,
         instagram: true,
+        facebook: true,
         youtube: true
     });
     const [startOffset, setStartOffset] = useState(1);
@@ -110,10 +112,19 @@ export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, uploa
 
     if (!isOpen) return null;
 
-    const selectedPlatforms = Object.keys(platforms).filter(k => platforms[k]);
+    const capabilityMap = new Map(platformCapabilities.map((item) => [item.id, item]));
+    const availablePlatforms = capabilityMap.size
+        ? PLATFORM_OPTIONS.filter((option) => {
+            const capability = capabilityMap.get(option.value);
+            return capability?.configured && capability?.scheduling !== false;
+        }).map((option) => option.value)
+        : PLATFORM_OPTIONS.map((option) => option.value);
+    const selectedPlatforms = Object.keys(platforms).filter(
+        (key) => platforms[key] && availablePlatforms.includes(key)
+    );
 
     // Managed (cloud plan/trial) users post with the server-side key — no BYOK needed
-    const canPost = isManaged || (uploadPostKey && uploadUserId);
+    const canPost = socialReady ?? (isManaged || !!(uploadPostKey && uploadUserId));
 
     const handleScheduleAll = async () => {
         if (!canPost) return;
@@ -157,6 +168,11 @@ export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, uploa
                     throw new Error(errText);
                 }
 
+                const body = await res.json();
+                if (body.success === false) {
+                    const errors = (body.results || []).filter((row) => !row.ok).map((row) => row.error);
+                    throw new Error(errors.join('; ') || 'Scheduling failed');
+                }
                 results.push({ index: i, success: true });
             } catch (e) {
                 results.push({ index: i, success: false, error: e.message });
@@ -200,15 +216,9 @@ export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, uploa
                     )}
                 </button>
             ) : (
-                <a
-                    href="https://app.upload-post.com/calendar"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="btn-primary flex-1 no-underline"
-                >
-                    <ExternalLink size={16} />
-                    view calendar
-                </a>
+                <button onClick={onClose} className="btn-primary flex-1">
+                    <CheckCircle size={16} /> done
+                </button>
             )}
         </div>
     );
@@ -227,7 +237,7 @@ export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, uploa
             {!canPost && (
                 <div className="mb-4 p-3 bg-warn/10 text-warn text-xs rounded-input flex items-start gap-2">
                     <AlertCircle size={14} className="mt-0.5 shrink-0" />
-                    <div>Set your Upload-Post API key in Settings first.</div>
+                    <div>Configure a publishing destination in Settings first.</div>
                 </div>
             )}
 
@@ -326,11 +336,16 @@ export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, uploa
                 <label className="eyebrow block mb-2">platforms</label>
                 <SegmentedControl
                     multi
-                    options={PLATFORM_OPTIONS.map(opt => ({ ...opt, disabled: scheduling }))}
+                    options={PLATFORM_OPTIONS.map(opt => ({
+                        ...opt,
+                        disabled: scheduling || !availablePlatforms.includes(opt.value),
+                        hint: availablePlatforms.includes(opt.value) ? undefined : 'direct scheduling unavailable',
+                    }))}
                     value={selectedPlatforms}
                     onChange={(arr) => setPlatforms({
                         tiktok: arr.includes('tiktok'),
                         instagram: arr.includes('instagram'),
+                        facebook: arr.includes('facebook'),
                         youtube: arr.includes('youtube')
                     })}
                 />

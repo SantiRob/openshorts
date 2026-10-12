@@ -40,11 +40,13 @@ function saveCache(url, analysis, webResearch, scripts) {
   } catch { /* localStorage full */ }
 }
 
-export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uploadPostKey, uploadUserId, managed = false }) {
+export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uploadPostKey, uploadUserId, managed = false, socialReady = null, platformCapabilities = [] }) {
   // Managed (hosted plan): Gemini (script) + Upload-Post run server-side via the
   // bearer token — no BYOK Gemini key needed. fal.ai + ElevenLabs stay BYOK.
   const geminiHeader = geminiApiKey ? { 'X-Gemini-Key': geminiApiKey } : {};
   const needsGeminiKey = !geminiApiKey && !managed;
+  const canPublish = socialReady ?? (managed || !!uploadPostKey);
+  const capabilityMap = new Map(platformCapabilities.map((item) => [item.id, item]));
   // Wizard state
   const [step, setStep] = useState(() => {
     const cache = loadCache();
@@ -92,9 +94,15 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
   // Publish
   const [publishing, setPublishing] = useState(false);
   const [publishResult, setPublishResult] = useState(null);
-  const [publishPlatforms, setPublishPlatforms] = useState({ tiktok: true, instagram: true, youtube: true });
+  const [publishPlatforms, setPublishPlatforms] = useState({ tiktok: true, instagram: true, facebook: true, youtube: true });
   const [isScheduling, setIsScheduling] = useState(false);
   const [scheduleDate, setScheduleDate] = useState('');
+  const availablePublishingPlatforms = (capabilityMap.size
+    ? ['tiktok', 'instagram', 'facebook', 'youtube'].filter((id) => {
+      const item = capabilityMap.get(id);
+      return item?.configured && (!isScheduling || item.scheduling !== false);
+    })
+    : ['tiktok', 'instagram', 'facebook', 'youtube']);
 
   // UI
   const [copied, setCopied] = useState('');
@@ -1379,8 +1387,8 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                   <div className="card p-4 space-y-3 mt-2">
                     <h3 className="eyebrow">Publish to Social Media</h3>
 
-                    {!uploadPostKey ? (
-                      <p className="text-xs lowercase text-muted">Set your Upload-Post API key in Settings to enable publishing.</p>
+                    {!canPublish ? (
+                      <p className="text-xs lowercase text-muted">Configure a publishing destination in Settings to enable publishing.</p>
                     ) : (
                       <>
                         {/* Platform toggles */}
@@ -1390,12 +1398,18 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                           options={[
                             { value: 'tiktok', label: 'TikTok' },
                             { value: 'instagram', label: 'Instagram' },
+                            { value: 'facebook', label: 'Facebook Reels' },
                             { value: 'youtube', label: 'YouTube' },
-                          ]}
-                          value={Object.keys(publishPlatforms).filter((k) => publishPlatforms[k])}
+                          ].map((option) => ({
+                            ...option,
+                            disabled: !availablePublishingPlatforms.includes(option.value),
+                            hint: availablePublishingPlatforms.includes(option.value) ? undefined : 'not available',
+                          }))}
+                          value={Object.keys(publishPlatforms).filter((k) => publishPlatforms[k] && availablePublishingPlatforms.includes(k))}
                           onChange={(arr) => setPublishPlatforms({
                             tiktok: arr.includes('tiktok'),
                             instagram: arr.includes('instagram'),
+                            facebook: arr.includes('facebook'),
                             youtube: arr.includes('youtube'),
                           })}
                         />
@@ -1434,7 +1448,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                         {/* Publish button */}
                         <button
                           onClick={async () => {
-                            const selected = Object.keys(publishPlatforms).filter(k => publishPlatforms[k]);
+                            const selected = Object.keys(publishPlatforms).filter(k => publishPlatforms[k] && availablePublishingPlatforms.includes(k));
                             if (selected.length === 0) { setPublishResult({ ok: false, msg: 'Select at least one platform' }); return; }
                             if (isScheduling && !scheduleDate) { setPublishResult({ ok: false, msg: 'Select a date' }); return; }
 
@@ -1461,6 +1475,11 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                               if (!res.ok) {
                                 const err = await res.json().catch(() => ({ detail: 'Failed' }));
                                 throw new Error(err.detail || 'Failed');
+                              }
+                              const body = await res.json();
+                              if (body.success === false) {
+                                const failures = (body.results || []).filter((row) => !row.ok).map((row) => `${row.platform}: ${row.error}`);
+                                throw new Error(failures.join('; ') || 'Publishing failed');
                               }
                               setPublishResult({ ok: true, msg: isScheduling ? 'Scheduled!' : 'Published!' });
                             } catch (e) {

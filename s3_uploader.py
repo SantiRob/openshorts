@@ -13,10 +13,20 @@ logging.getLogger('s3transfer').setLevel(logging.CRITICAL)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+
+def _local_storage_only():
+    """Local self-hosting is the safe default; S3 must be explicitly enabled."""
+    return os.environ.get('LOCAL_STORAGE_ONLY', '1').strip().lower() in {
+        '1', 'true', 'yes', 'on'
+    }
+
 def upload_file_to_s3(file_path, bucket_name, s3_key):
     """
     Upload a file to an S3 bucket silently.
     """
+    if _local_storage_only():
+        return False
+
     access_key = os.environ.get('AWS_ACCESS_KEY_ID')
     secret_key = os.environ.get('AWS_SECRET_ACCESS_KEY')
     region = os.environ.get('AWS_REGION', 'eu-west-3')
@@ -54,6 +64,9 @@ CACHE_TTL_SECONDS = 300  # 5 minutes
 
 def get_s3_client():
     """Returns an authenticated S3 client."""
+    if _local_storage_only():
+        return None
+
     access_key = os.environ.get('AWS_ACCESS_KEY_ID')
     secret_key = os.environ.get('AWS_SECRET_ACCESS_KEY')
     region = os.environ.get('AWS_REGION', 'eu-west-3')
@@ -431,6 +444,9 @@ def upload_job_artifacts(directory, job_id):
     """
     Upload all generated clips and metadata for a job to S3.
     """
+    if _local_storage_only():
+        return
+
     bucket_name = os.environ.get('AWS_S3_BUCKET', 'my-clips-bucket')
     
     if not os.path.exists(directory):

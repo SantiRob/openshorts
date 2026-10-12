@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { Upload, Sparkles, Youtube, Instagram, Share2, ChevronDown, Check, Activity, LayoutDashboard, Settings, Plus, History, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Mail, Loader2, Download, Menu, Lock, Rocket } from 'lucide-react';
-import KeyInput from './components/KeyInput';
 import MediaInput from './components/MediaInput';
+import IntegrationSettings from './components/IntegrationSettings';
 import McpConnectCard from './components/McpConnectCard';
 import ResultCard from './components/ResultCard';
 import ProcessingAnimation from './components/ProcessingAnimation';
@@ -267,7 +267,7 @@ const pollJob = async (jobId) => {
 
 function App() {
   // Cloud auth/billing session (inert when billing is disabled).
-  const { billingEnabled, isManaged, isSignedIn, me, plan, refreshMe, jobRetentionSeconds, localLlm } = useAuth();
+  const { billingEnabled, isManaged, isSignedIn, me, plan, refreshMe, jobRetentionSeconds, localLlm, aiProviders } = useAuth();
   const [showLogin, setShowLogin] = useState(false);
   const [showTopUp, setShowTopUp] = useState(false);
   const [showPlanChoice, setShowPlanChoice] = useState(false);
@@ -289,7 +289,7 @@ function App() {
 
   const [apiKey, setApiKey] = useState(localStorage.getItem('gemini_key') || '');
   // Social API State - Load encrypted or plain
-  const [uploadPostKey, setUploadPostKey] = useState(() => {
+  const [uploadPostKey] = useState(() => {
     const stored = localStorage.getItem('uploadPostKey_v3');
     if (stored) return decrypt(stored);
     return '';
@@ -310,6 +310,8 @@ function App() {
 
   const [uploadUserId, setUploadUserId] = useState(() => localStorage.getItem('uploadUserId') || '');
   const [userProfiles, setUserProfiles] = useState([]); // List of {username, connected: []}
+  const [socialCapabilities, setSocialCapabilities] = useState(null);
+  const [socialCapabilitiesLoading, setSocialCapabilitiesLoading] = useState(false);
   // Post-generation social nudge: shown at the results peak until the user
   // either connects a network or dismisses it. Only 2.7% of cloud users who
   // reach the social flow ever connect an account — this is the moment (clips
@@ -685,6 +687,22 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [uploadPostKey, isManaged]);
 
+  const refreshSocialCapabilities = async () => {
+    setSocialCapabilitiesLoading(true);
+    try {
+      const res = await apiFetch('/api/social/capabilities');
+      if (!res.ok) throw new Error('Capabilities unavailable');
+      setSocialCapabilities(await res.json());
+    } catch (_) {
+      // Compatibility with older backends while containers are upgraded.
+      setSocialCapabilities(null);
+    } finally {
+      setSocialCapabilitiesLoading(false);
+    }
+  };
+
+  useEffect(() => { refreshSocialCapabilities(); }, []);
+
   // For managed users, fetch the durable R2 URLs of the current job's clips. The
   // preview player prefers them (free egress, edge-served, and not competing with
   // the renders for the API process), and falls back to /videos when the local
@@ -800,8 +818,30 @@ function App() {
   // `keysMissing` now means "self-host BYOK keys missing" — it never fires on hosted.
   // A self-hosted server running the moment picker on a local LLM
   // (LLM_BASE_URL) does not need a Gemini key for the core pipeline.
-  const geminiOk = !!apiKey || !!localLlm;
-  const keysMissing = !billingEnabled && (!geminiOk || !uploadPostKey);
+  const serverAiReady = !!(
+    aiProviders?.configured
+    || aiProviders?.bedrock?.configured
+    || (Array.isArray(aiProviders?.providers)
+      ? aiProviders.providers.some((provider) => provider.available || provider.configured)
+      : aiProviders?.providers?.bedrock?.configured)
+  );
+  const geminiOk = !!apiKey || !!localLlm || serverAiReady;
+  const capabilityPlatforms = (() => {
+    const raw = socialCapabilities?.platforms;
+    if (Array.isArray(raw)) return raw.map((p) => typeof p === 'string' ? { id: p, configured: true } : { id: p.id || p.platform, ...p });
+    if (raw && typeof raw === 'object') return Object.entries(raw).map(([id, p]) => typeof p === 'boolean' ? { id, configured: p } : { id, ...p });
+    return [];
+  })();
+  const configuredSocialPlatforms = capabilityPlatforms.filter((p) => p.configured !== false).map((p) => p.id);
+  const directSocialReady = typeof socialCapabilities?.configured === 'boolean'
+    ? socialCapabilities.configured
+    : Array.isArray(socialCapabilities?.configured)
+      ? socialCapabilities.configured.length > 0
+      : configuredSocialPlatforms.length > 0;
+  const socialReady = socialCapabilities
+    ? directSocialReady
+    : isManaged || !!(uploadPostKey && uploadUserId);
+  const keysMissing = !billingEnabled && !geminiOk;
   const needsPlan = billingEnabled && !isManaged;   // hosted, signed-out or no active plan/trial
 
   // Fresh sign-up: Clip Generator tutorial (AuthContext set os_show_clip_tutorial
@@ -916,8 +956,7 @@ function App() {
   // Social nudge visibility: managed users with clips on screen and no network
   // connected yet. userProfiles being empty (not yet fetched / none created)
   // also counts as "not connected" — that is the 97% case.
-  const connectedSocials = ((userProfiles.find((p) => p.username === uploadUserId) || userProfiles[0])?.connected) || [];
-  const showSocialNudge = isManaged && !socialNudgeDismissed && connectedSocials.length === 0 && !tutorialLock;
+  const showSocialNudge = isManaged && !socialNudgeDismissed && !socialReady && !tutorialLock;
 
   // One Seen event per job, only when the banner actually rendered.
   const socialNudgeSeenRef = useRef(null);
@@ -928,27 +967,9 @@ function App() {
     }
   }, [status, results, showSocialNudge, jobId]);
 
-  // Managed users connect their socials via Upload-Post's branded hosted page.
-  const handleConnectSocials = async () => {
-    try {
-      const { access_url } = await apiJson('/api/social/connect', { method: 'POST' });
-      // Same tab so the connect page's redirectUrl brings the user back into the app.
-      if (access_url) window.location.href = access_url;
-    } catch (e) {
-      alert('Could not open the connection page. Please try again.');
-    }
-  };
-
-  // Open the Upload-Post white-label page (which includes the scheduling calendar)
-  // in a new tab, for consulting/managing scheduled posts from the dashboard.
-  const handleOpenCalendar = async () => {
-    try {
-      const { access_url } = await apiJson('/api/social/connect', { method: 'POST' });
-      if (access_url) window.open(access_url, '_blank', 'noopener');
-    } catch (e) {
-      alert('Could not open the calendar. Please try again.');
-    }
-  };
+  // Credentials are deployment-owned. The setup action stays inside this app
+  // and explains which server integrations still need configuration.
+  const handleConnectSocials = () => setActiveTab('settings');
 
   const handleProcess = async (data, forceLowQuality = false) => {
     // Hosted: must be signed in AND on an active plan/trial. Self-host: BYOK keys.
@@ -1143,7 +1164,7 @@ function App() {
   // wraps to two lines in a 5-up bar on a 360px phone.
   const navItems = [
     { id: 'dashboard', ord: '01', icon: LayoutDashboard, label: 'Clip Generator', short: 'clips', primary: true },
-    // Cloud only: it runs on the managed pipeline and the Upload-Post connection.
+    // Cloud only: it runs on the managed pipeline and configured publishers.
     ...(billingEnabled ? [{ id: 'autopilot', ord: '02', icon: Rocket, label: 'Autopilot', short: 'autopilot', isNew: true }] : []),
     { id: 'saasshorts', ord: '03', icon: Sparkles, label: 'AI Shorts', short: 'ai shorts', byok: true, primary: true },
     { id: 'ai-agent', ord: '04', icon: Bot, label: 'AI Agent', short: 'agent', byok: true },
@@ -1437,13 +1458,7 @@ function App() {
                 title="Configure API keys or choose a plan"
               >
                 <AlertTriangle size={12} />
-                <span className="hidden md:inline">
-                  {!geminiOk && !uploadPostKey
-                    ? 'Gemini & Upload-Post keys missing'
-                    : !geminiOk
-                      ? 'Gemini API Key Missing'
-                      : 'Upload-Post API Key Missing'}
-                </span>
+                <span className="hidden md:inline">AI provider not configured</span>
                 <span className="md:hidden">keys missing</span>
               </button>
             )}
@@ -1456,14 +1471,8 @@ function App() {
             <div className="flex items-start sm:items-center gap-2.5 sm:gap-3 text-sm text-ink2 min-w-0 flex-1">
               <KeyRound size={16} className="shrink-0 text-warn mt-0.5 sm:mt-0" />
               <div className="min-w-0">
-                <span className="font-medium text-ink">Required API keys missing.</span>{' '}
-                <span className="text-muted">
-                  {!geminiOk && !uploadPostKey
-                    ? 'Set your Gemini and Upload-Post API keys to use OpenShorts.'
-                    : !geminiOk
-                      ? 'Set your Gemini API key to use OpenShorts.'
-                      : 'Set your Upload-Post API key to use OpenShorts.'}
-                </span>
+                <span className="font-medium text-ink">AI provider not configured.</span>{' '}
+                <span className="text-muted">Configure Bedrock on the server or add a Gemini API key.</span>
               </div>
             </div>
             <button
@@ -1531,16 +1540,11 @@ function App() {
                   <p className="text-xs text-muted mb-5 leading-relaxed">
                     Your plan includes the <strong>Clip Generator</strong> and <strong>YouTube Studio</strong>,
                     fully managed — no API keys required. AI Shorts &amp; dubbing use your own fal.ai / ElevenLabs
-                    keys (below). Connect your social accounts to publish directly.
+                    keys (below). Publishing destinations are configured on this deployment.
                   </p>
-                  <div className="flex flex-wrap gap-2">
-                    <button onClick={handleConnectSocials} className="btn-primary py-2 px-4 text-sm">
-                      <Share2 size={16} /> Connect social accounts
-                    </button>
-                    <button onClick={handleOpenCalendar} className="btn-quiet py-2 px-4 text-sm">
-                      <Calendar size={16} /> Content calendar
-                    </button>
-                  </div>
+                  <button onClick={refreshSocialCapabilities} className="btn-quiet py-2 px-4 text-sm">
+                    <RotateCcw size={15} /> Check publishing setup
+                  </button>
                 </div>
               ) : billingEnabled ? (
                 <div className="card p-6 mb-2">
@@ -1560,64 +1564,19 @@ function App() {
                     <Sparkles size={16} /> Choose a plan
                   </button>
                 </div>
-              ) : (
-                <>
-              <KeyInput onKeySet={setApiKey} savedKey={apiKey} />
+              ) : null}
 
-              <div className="card p-4 sm:p-6 mt-8">
-                <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
-                  <div className="flex items-center gap-3">
-                    <div className="w-9 h-9 rounded-input bg-paper3 flex items-center justify-center shrink-0">
-                      <Share2 size={16} className="text-brass" />
-                    </div>
-                    <h2 className="text-base font-medium text-ink lowercase">Social Integration</h2>
-                  </div>
-                  <span className="badge-warn">Required</span>
-                </div>
-                <p className="text-xs text-muted mb-6 leading-relaxed">
-                  Required to publish your clips to TikTok, Instagram Reels, and YouTube Shorts via <strong>Upload-Post</strong>.
-                  Includes a <strong>free tier</strong> (no credit card required).
-                </p>
-                <div className="space-y-4">
-                  <label className="block text-sm text-muted">Upload-Post API Key</label>
-                  <div className="flex flex-col sm:flex-row gap-2">
-                    <input
-                      type="password"
-                      value={uploadPostKey}
-                      onChange={(e) => setUploadPostKey(e.target.value)}
-                      className="input-field"
-                      placeholder="ey..."
-                    />
-                    <button onClick={fetchUserProfiles} className="btn-quiet py-2 px-4 text-sm">
-                      Connect
-                    </button>
-                  </div>
-                  <div className="text-xs text-muted leading-relaxed">
-                    Connect your Upload-Post account to enable one-click publishing.
-                    <div className="mt-3 grid grid-cols-1 sm:grid-cols-3 gap-2">
-                      <a href="https://app.upload-post.com/login" target="_blank" rel="noopener noreferrer" className="p-2 border border-rule rounded-input hover:bg-paper3 transition-colors flex flex-col gap-1">
-                        <span className="text-ink2 font-medium">1. Login</span>
-                        <span className="text-xs text-muted">Register account</span>
-                      </a>
-                      <a href="https://app.upload-post.com/manage-users" target="_blank" rel="noopener noreferrer" className="p-2 border border-rule rounded-input hover:bg-paper3 transition-colors flex flex-col gap-1">
-                        <span className="text-ink2 font-medium">2. Profiles</span>
-                        <span className="text-xs text-muted">Create & Connect</span>
-                      </a>
-                      <a href="https://app.upload-post.com/api-keys" target="_blank" rel="noopener noreferrer" className="p-2 border border-rule rounded-input hover:bg-paper3 transition-colors flex flex-col gap-1">
-                        <span className="text-ink2 font-medium">3. API Key</span>
-                        <span className="text-xs text-muted">Generate key</span>
-                      </a>
-                    </div>
-                    <br />
-                    <span className="text-muted">
-                      Keys are only stored in your browser. They are sent to the backend only to process your request, never stored server-side.
-                    </span>
-                  </div>
-                </div>
+              <div className="mt-8">
+                <IntegrationSettings
+                  aiProviders={aiProviders}
+                  geminiApiKey={apiKey}
+                  localLlm={localLlm}
+                  onGeminiKeySet={setApiKey}
+                  socialCapabilities={socialCapabilities}
+                  socialLoading={socialCapabilitiesLoading}
+                  onRefreshSocial={refreshSocialCapabilities}
+                />
               </div>
-
-                </>
-              )}
 
               <div className="card p-4 sm:p-6 mt-8">
                 <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
@@ -1738,7 +1697,7 @@ function App() {
 
           {/* View: SaaS Shorts */}
           {activeTab === 'saasshorts' && (
-            <SaaShortsTab geminiApiKey={apiKey} elevenLabsKey={elevenLabsKey} falKey={falKey} uploadPostKey={uploadPostKey} uploadUserId={uploadUserId} managed={isManaged} />
+            <SaaShortsTab geminiApiKey={apiKey} elevenLabsKey={elevenLabsKey} falKey={falKey} uploadPostKey={uploadPostKey} uploadUserId={uploadUserId} managed={isManaged} socialReady={socialReady} platformCapabilities={capabilityPlatforms} />
           )}
 
           {/* View: AI Agent */}
@@ -1798,7 +1757,7 @@ function App() {
                     </div>
                     <h3 className="font-medium text-ink lowercase">3. You validate, it ships</h3>
                     <p className="text-xs text-muted leading-relaxed">
-                      Approve the candidates you like and the skill auto-publishes them to TikTok, Reels and YouTube Shorts via Upload-Post.
+                      Approve the candidates you like and publish them to configured YouTube Shorts and Meta Reels destinations.
                     </p>
                   </div>
                 </div>
@@ -1906,6 +1865,8 @@ function App() {
               uploadPostKey={uploadPostKey}
               uploadUserId={uploadUserId}
               managed={isManaged}
+              socialReady={socialReady}
+              youtubeReady={socialCapabilities ? configuredSocialPlatforms.includes('youtube') : null}
               onCreateClips={(sessionId) => {
                 setActiveTab('dashboard');
                 // The Studio source is the user's own upload, published to their
@@ -2223,8 +2184,10 @@ function App() {
                           geminiApiKey={apiKey}
                           elevenLabsKey={elevenLabsKey}
                           isManaged={isManaged}
-                          connectedPlatforms={(userProfiles.find((p) => p.username === uploadUserId) || userProfiles[0])?.connected ?? null}
-                          onConnectSocials={isManaged ? handleConnectSocials : null}
+                          socialReady={socialReady}
+                          platformCapabilities={capabilityPlatforms}
+                          connectedPlatforms={socialCapabilities ? configuredSocialPlatforms : ((userProfiles.find((p) => p.username === uploadUserId) || userProfiles[0])?.connected ?? null)}
+                          onConnectSocials={handleConnectSocials}
                           onPlay={(time) => handleClipPlay(time)}
                           onPause={handleClipPause}
                           onBulkSubtitle={handleBulkSubtitles}
@@ -2267,11 +2230,7 @@ function App() {
         isOpen={showKeyModal}
         onClose={() => setShowKeyModal(false)}
         eyebrow="SETUP"
-        title={!geminiOk && !uploadPostKey
-          ? 'Required API Keys Missing'
-          : !geminiOk
-            ? 'Gemini API Key Required'
-            : 'Upload-Post API Key Required'}
+        title="AI provider required"
         footer={
           <div className="flex gap-3">
             <button
@@ -2291,7 +2250,7 @@ function App() {
       >
         <div className="space-y-4">
           <p className="text-sm text-muted">
-            OpenShorts needs both a <strong className="text-ink2">Gemini</strong> API key and an <strong className="text-ink2">Upload-Post</strong> API key. Both have free tiers.
+            Configure <strong className="text-ink2">Amazon Bedrock</strong> on the server, or add a <strong className="text-ink2">Gemini</strong> API key as a fallback.
           </p>
 
           {/* Gemini block */}
@@ -2322,36 +2281,6 @@ function App() {
             )}
           </div>
 
-          {/* Upload-Post block */}
-          <div className={`rounded-input p-4 space-y-2 border ${!uploadPostKey ? 'border-rule2' : 'border-rule opacity-70'}`}>
-            <p className="text-xs font-medium text-ink flex items-center gap-2">
-              {uploadPostKey ? <Check size={12} className="text-ok" /> : <AlertTriangle size={12} className="text-warn" />}
-              Upload-Post API Key {uploadPostKey && <span className="text-ok">— set</span>}
-            </p>
-            {!uploadPostKey && (
-              <>
-                <p className="text-xs text-muted">
-                  Required to publish your clips to TikTok, Instagram Reels, and YouTube Shorts. Free tier available, no credit card needed.
-                </p>
-                <ol className="text-xs text-muted space-y-1 list-decimal list-inside">
-                  <li>Register at <a href="https://app.upload-post.com/login" target="_blank" rel="noopener noreferrer" className="text-brass underline">app.upload-post.com</a></li>
-                  <li>Connect your TikTok, Instagram, or YouTube accounts</li>
-                  <li>Go to <a href="https://app.upload-post.com/api-keys" target="_blank" rel="noopener noreferrer" className="text-brass underline">API Keys</a> and generate one</li>
-                  <li>Paste it below</li>
-                </ol>
-                <input
-                  type="text"
-                  placeholder="Paste your Upload-Post API key here..."
-                  className="input-field"
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' && e.target.value.trim()) {
-                      setUploadPostKey(e.target.value.trim());
-                    }
-                  }}
-                />
-              </>
-            )}
-          </div>
         </div>
       </Modal>
 
@@ -2363,6 +2292,8 @@ function App() {
         uploadPostKey={uploadPostKey}
         uploadUserId={uploadUserId}
         isManaged={isManaged}
+        socialReady={socialReady}
+        platformCapabilities={capabilityPlatforms}
       />
 
       {/* Pre-flight quality gate */}

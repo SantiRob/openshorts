@@ -2,6 +2,11 @@ services:
   backend:
     build: .
     container_name: openshorts-backend
+    # Pass self-host configuration (Bedrock/Gemini and direct social
+    # credentials) to the API without baking any secret into the image.
+    env_file:
+      - path: .env
+        required: false
     ports:
       - "8000:8000"
     volumes:

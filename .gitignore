@@ -26,6 +26,9 @@ output/
 
 # Secrets
 .env
+secrets/
+youtube_token.json
+*_client_secrets.json
 
 # Generated metadata
 *_metadata.json

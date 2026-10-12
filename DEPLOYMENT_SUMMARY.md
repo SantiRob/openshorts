@@ -14,7 +14,7 @@
 
 **Solution:** Configurable fallback chain:
 ```
-Gemini (free) → Claude → DeepSeek → OpenAI → Grok → Bedrock Nova
+Bedrock Nova → Gemini (three attempts per provider)
 ```
 
 **Files Modified:**
@@ -150,7 +150,7 @@ DEEPSEEK_API_KEY=your_deepseek_key_here
 # XAI_API_KEY=your_xai_key_here
 
 # Custom fallback order (OPTIONAL)
-LLM_FALLBACK_ORDER=gemini,claude,deepseek,openai,grok,bedrock-nova
+LLM_FALLBACK_ORDER=bedrock,gemini
 
 # YouTube publishing paths (Part B)
 YOUTUBE_TOKEN_PATH=secrets/youtube_token.json

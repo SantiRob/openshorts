@@ -25,7 +25,7 @@ const HOSTED_VS_SELF = [
     icon: Send,
     label: 'Auto-posting',
     hosted: 'TikTok, Instagram Reels and YouTube Shorts connect straight from your account.',
-    self: 'You register your own Upload-Post account and wire up the credentials.',
+    self: 'You configure YouTube and Meta credentials on your own deployment.',
   },
   {
     icon: Server,

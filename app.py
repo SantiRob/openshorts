@@ -1,5 +1,6 @@
 import os
 import llm_backend
+import llm_providers
 import re
 import sys
 import uuid
@@ -31,6 +32,7 @@ from pydantic import BaseModel
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
 import recut
 import layout_ranges
+from social_publishers import PublishInput, SocialPublishingService
 
 load_dotenv()
 
@@ -122,6 +124,9 @@ for _stream in (sys.stdout, sys.stderr):
 # when BILLING_ENABLED is set. With the flag off, the app behaves exactly as the
 # self-hosted BYOK app does today (no extra dependencies required).
 BILLING_ENABLED = os.environ.get("BILLING_ENABLED", "").lower() in ("1", "true", "yes")
+LOCAL_STORAGE_ONLY = os.environ.get("LOCAL_STORAGE_ONLY", "1").lower() in (
+    "1", "true", "yes", "on"
+)
 
 # Job/file retention (issue #46). Self-host defaults to 24h: the 1h sweep kept
 # deleting finished projects under users who never touched their env, and the
@@ -2469,7 +2474,7 @@ async def run_job(job_id, job_data):
             
             # Self-host: silent AWS S3 backup. Cloud mode stores to R2 instead
             # (see _archive_managed_job), so skip the redundant/paid AWS upload.
-            if not BILLING_ENABLED:
+            if not BILLING_ENABLED and not LOCAL_STORAGE_ONLY:
                 loop = asyncio.get_event_loop()
                 loop.run_in_executor(None, upload_job_artifacts, output_dir, job_id)
             
@@ -2544,6 +2549,10 @@ async def get_config():
         # Self-host only: tells the dashboard the Gemini key is optional
         # because the moment picker runs on an OpenAI-compatible server.
         "localLlm": None if BILLING_ENABLED else llm_backend.describe(),
+        # Non-secret state for the self-hosted integrations UI. Credentials
+        # remain server-side; the browser only sees order, models and readiness.
+        "aiProviders": (None if BILLING_ENABLED
+                        else llm_providers.describe_configuration()),
     }
 
 async def _probe_youtube_quality(url: str) -> dict:
@@ -5253,6 +5262,27 @@ class SocialPostRequest(BaseModel):
 import httpx
 
 
+@app.get("/api/social/capabilities")
+async def social_capabilities():
+    """Describe server-side publishers without ever returning credentials."""
+    backend = os.environ.get("SOCIAL_PUBLISH_BACKEND", "direct").strip().lower()
+    if backend == "upload-post":
+        configured = bool(
+            os.environ.get("UPLOAD_POST_API_KEY")
+            or os.environ.get("MANAGED_UPLOAD_POST_API_KEY")
+        )
+        return {
+            "backend": "upload-post",
+            "platforms": {
+                name: {"configured": configured, "scheduling": True}
+                for name in ("youtube", "facebook", "instagram", "tiktok")
+            },
+            "configured": (["youtube", "facebook", "instagram", "tiktok"]
+                           if configured else []),
+        }
+    return SocialPublishingService.from_env().capabilities()
+
+
 def _post_video_blocking(url, headers, data, file_path, filename, timeout):
     """Multipart POST of a video to Upload-Post. Blocking: call it through
     asyncio.to_thread from a request handler, never inline."""
@@ -5268,12 +5298,15 @@ async def post_to_socials(req: SocialPostRequest, request: Request):
     if req.job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    # Resolve the Upload-Post key + profile. For managed users the server key is
-    # used and their own profile is forced (body api_key / user_id are ignored).
-    upload_key, forced_profile = await resolve_upload_post(request, req.api_key)
-    if not upload_key:
-        raise HTTPException(status_code=400, detail="Missing Upload-Post API key")
-    post_user = resolve_post_profile(forced_profile, req.user_id)
+    backend = os.environ.get("SOCIAL_PUBLISH_BACKEND", "direct").strip().lower()
+    upload_key = post_user = None
+    if backend == "upload-post":
+        # Compatibility escape hatch for existing deployments. Direct is the
+        # default and never accepts provider credentials from the request.
+        upload_key, forced_profile = await resolve_upload_post(request, req.api_key)
+        if not upload_key:
+            raise HTTPException(status_code=400, detail="Missing Upload-Post API key")
+        post_user = resolve_post_profile(forced_profile, req.user_id)
 
     job = jobs[req.job_id]
     await _assert_job_owner(request, job)
@@ -5297,6 +5330,29 @@ async def post_to_socials(req: SocialPostRequest, request: Request):
         # Fallbacks
         final_title = req.title or clip.get('title', 'Viral Short')
         final_description = req.description or clip.get('video_description_for_instagram') or clip.get('video_description_for_tiktok') or "Check this out!"
+
+        if backend != "upload-post":
+            scheduled_at = None
+            if req.scheduled_date:
+                try:
+                    scheduled_at = datetime.fromisoformat(req.scheduled_date.replace("Z", "+00:00"))
+                    if scheduled_at.tzinfo is None:
+                        scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail="scheduled_date must be ISO-8601") from exc
+            service = SocialPublishingService.from_env()
+            item = PublishInput(
+                video_path=file_path,
+                title=req.title or clip.get('video_title_for_youtube_short') or final_title,
+                description=final_description,
+                tags=tuple(clip.get("tags") or ("shorts",)),
+                scheduled_at=scheduled_at,
+            )
+            # Uploads are blocking and may take minutes. Keep the event loop
+            # responsive while each direct adapter performs its protocol.
+            return await asyncio.to_thread(
+                service.publish, req.platforms, item, clip.get("video_url", "")
+            )
         
         # Prepare form data
         url = "https://api.upload-post.com/api/upload"
@@ -5349,6 +5405,8 @@ async def post_to_socials(req: SocialPostRequest, request: Request):
 
         return response.json()
 
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"❌ Social Post Exception: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -6091,17 +6149,9 @@ async def thumbnail_publish(
     api_key: Optional[str] = Form(None),   # BYOK; ignored for managed users
     user_id: Optional[str] = Form(None),   # BYOK profile; ignored for managed users
 ):
-    """Kick off a background upload to YouTube via Upload-Post and return immediately."""
+    """Kick off a background upload to YouTube and return immediately."""
     if session_id not in thumbnail_sessions:
         raise HTTPException(status_code=404, detail="Session not found")
-
-    # Managed users: server key + forced own profile; body fields ignored.
-    upload_key, forced_profile = await resolve_upload_post(request, api_key)
-    if not upload_key:
-        raise HTTPException(status_code=400, detail="Missing Upload-Post API key")
-    post_user = forced_profile or user_id
-    if not post_user:
-        raise HTTPException(status_code=400, detail="Missing Upload-Post user profile")
 
     session = thumbnail_sessions[session_id]
     await _assert_job_owner(request, session)
@@ -6123,14 +6173,44 @@ async def thumbnail_publish(
     if not os.path.exists(thumb_path):
         raise HTTPException(status_code=404, detail="Thumbnail file not found")
 
+    backend = os.environ.get("SOCIAL_PUBLISH_BACKEND", "direct").strip().lower()
+    upload_key = post_user = None
+    if backend == "upload-post":
+        # Legacy compatibility only. New deployments use the YouTube OAuth
+        # token configured on the server.
+        upload_key, forced_profile = await resolve_upload_post(request, api_key)
+        if not upload_key:
+            raise HTTPException(status_code=400, detail="Missing Upload-Post API key")
+        post_user = forced_profile or user_id
+        if not post_user:
+            raise HTTPException(status_code=400, detail="Missing Upload-Post user profile")
+    elif "youtube" not in SocialPublishingService.from_env().publishers:
+        raise HTTPException(status_code=400, detail="YouTube publishing is not configured")
+
     # Generate a unique ID for this publish job so the frontend can poll
     publish_id = str(uuid.uuid4())
     publish_jobs[publish_id] = {"status": "uploading", "result": None, "error": None,
                                 "user_id": session.get("user_id")}
 
     def do_upload():
-        """Runs in a thread via BackgroundTasks — does the actual multipart upload."""
+        """Runs in a thread via BackgroundTasks — does the blocking upload."""
         try:
+            if backend != "upload-post":
+                service = SocialPublishingService.from_env()
+                result = service.publish(["youtube"], PublishInput(
+                    video_path=video_path,
+                    title=title,
+                    description=description,
+                    tags=("shorts",),
+                    thumbnail_path=thumb_path,
+                ))
+                row = (result.get("results") or [{}])[0]
+                if not result.get("success"):
+                    raise RuntimeError(row.get("error") or "YouTube upload failed")
+                publish_jobs[publish_id]["status"] = "done"
+                publish_jobs[publish_id]["result"] = result
+                return
+
             upload_url = "https://api.upload-post.com/api/upload"
             headers = {"Authorization": f"Apikey {upload_key}"}
             data_payload = {
@@ -6376,13 +6456,13 @@ async def saasshorts_actor_options(
             ),
         )
 
-        # Upload each actor image to public S3 with description
+        # Local mode returns authenticated /videos URLs and never contacts S3.
         desc = req.actor_description
         if req.product_description:
             desc += f" (holding {req.product_description})"
         urls = []
         for p in paths:
-            s3_url = upload_actor_to_s3(p, description=desc)
+            s3_url = None if LOCAL_STORAGE_ONLY else upload_actor_to_s3(p, description=desc)
             if s3_url:
                 urls.append(s3_url)
             else:
@@ -6419,14 +6499,17 @@ class SaaSPostRequest(BaseModel):
 
 @app.post("/api/saasshorts/post")
 async def saasshorts_post_to_socials(req: SaaSPostRequest, request: Request):
-    """Post an AI Shorts video to social media via Upload-Post."""
+    """Post an AI Shorts video through the configured publishing backend."""
     if req.job_id not in saas_jobs:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    upload_key, forced_profile = await resolve_upload_post(request, req.api_key)
-    if not upload_key:
-        raise HTTPException(status_code=400, detail="Missing Upload-Post API key")
-    post_user = resolve_post_profile(forced_profile, req.user_id)
+    backend = os.environ.get("SOCIAL_PUBLISH_BACKEND", "direct").strip().lower()
+    upload_key = post_user = None
+    if backend == "upload-post":
+        upload_key, forced_profile = await resolve_upload_post(request, req.api_key)
+        if not upload_key:
+            raise HTTPException(status_code=400, detail="Missing Upload-Post API key")
+        post_user = resolve_post_profile(forced_profile, req.user_id)
 
     job = saas_jobs[req.job_id]
     await _assert_job_owner(request, job)
@@ -6448,6 +6531,32 @@ async def saasshorts_post_to_socials(req: SaaSPostRequest, request: Request):
         final_description = req.description or script.get("caption", "")
         if not final_description:
             final_description = script.get("full_narration", "Check this out!")
+
+        if backend != "upload-post":
+            scheduled_at = None
+            if req.scheduled_date:
+                try:
+                    scheduled_at = datetime.fromisoformat(
+                        req.scheduled_date.replace("Z", "+00:00"))
+                    if scheduled_at.tzinfo is None:
+                        scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
+                except ValueError as exc:
+                    raise HTTPException(
+                        status_code=422, detail="scheduled_date must be ISO-8601"
+                    ) from exc
+            service = SocialPublishingService.from_env()
+            return await asyncio.to_thread(
+                service.publish,
+                req.platforms,
+                PublishInput(
+                    video_path=file_path,
+                    title=final_title,
+                    description=final_description,
+                    tags=("shorts",),
+                    scheduled_at=scheduled_at,
+                ),
+                video_url,
+            )
 
         url = "https://api.upload-post.com/api/upload"
         headers = {"Authorization": f"Apikey {upload_key}"}

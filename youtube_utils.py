@@ -30,7 +30,7 @@ from typing import Optional, Tuple, Dict, Any
 import httpx
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google.auth.oauthlib.flow import InstalledAppFlow
+from google_auth_oauthlib.flow import InstalledAppFlow
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +53,11 @@ class YouTubeUploader:
 
     # API endpoints
     API_BASE = "https://www.googleapis.com/youtube/v3"
-    RESUMABLE_UPLOAD_ENDPOINT = f"{API_BASE}/videos?uploadType=resumable&part=snippet,status"
+    # Media uploads use the /upload host path, not the metadata API path.
+    RESUMABLE_UPLOAD_ENDPOINT = (
+        "https://www.googleapis.com/upload/youtube/v3/videos"
+        "?uploadType=resumable&part=snippet,status"
+    )
     QUOTA_ENDPOINT = f"{API_BASE}/channels?part=statistics"
 
     def __init__(self, token_path: str, quota_warning_mb: int = 450):
@@ -171,10 +175,9 @@ class YouTubeUploader:
         access_token = self._get_access_token()
         headers = {
             "Authorization": f"Bearer {access_token}",
-            "X-Goog-Upload-Protocol": "resumable",
-            "X-Goog-Upload-Command": "start",
-            "X-Goog-Upload-Header-Content-Length": str(video_path.stat().st_size),
-            "Content-Type": "application/json"
+            "X-Upload-Content-Length": str(video_path.stat().st_size),
+            "X-Upload-Content-Type": "video/mp4",
+            "Content-Type": "application/json; charset=UTF-8",
         }
 
         # Initiate resumable session
@@ -209,7 +212,9 @@ class YouTubeUploader:
 
                 end = min(uploaded + len(chunk) - 1, file_size - 1)
                 headers = {
+                    "Authorization": f"Bearer {access_token}",
                     "Content-Length": str(len(chunk)),
+                    "Content-Type": "video/mp4",
                     "Content-Range": f"bytes {uploaded}-{end}/{file_size}",
                 }
 
@@ -240,6 +245,7 @@ class YouTubeUploader:
                         raise YouTubeUploadError(f"Invalid response: {response.text[:200]}")
 
                 else:
+                    percent = int(100 * uploaded / file_size)
                     raise YouTubeUploadError(
                         f"Upload failed at {percent}%: {response.status_code} {response.text[:200]}"
                     )
@@ -277,6 +283,32 @@ class YouTubeUploader:
         except Exception as e:
             logger.warning(f"Could not check quota: {e}")
             return {}
+
+    def set_thumbnail(self, video_id: str, thumbnail_path: str) -> Dict[str, Any]:
+        """Set a custom thumbnail on an uploaded video."""
+        path = Path(thumbnail_path)
+        if not path.is_file():
+            raise YouTubeUploadError(f"Thumbnail file not found: {path}")
+        access_token = self._get_access_token()
+        content_type = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
+        response = httpx.post(
+            "https://www.googleapis.com/upload/youtube/v3/thumbnails/set",
+            params={"videoId": video_id},
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": content_type,
+            },
+            content=path.read_bytes(),
+            timeout=60,
+        )
+        if response.status_code not in (200, 201):
+            raise YouTubeUploadError(
+                f"Failed to set thumbnail: {response.status_code} {response.text[:200]}"
+            )
+        try:
+            return response.json()
+        except json.JSONDecodeError:
+            return {"videoId": video_id}
 
     def get_video_status(self, video_id: str) -> Dict[str, Any]:
         """Get current status and metadata of an uploaded video."""

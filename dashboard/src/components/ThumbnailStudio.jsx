@@ -70,11 +70,12 @@ function DragDropZone({ label, accept, onFile, file, onClear, icon }) {
   );
 }
 
-export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUserId, managed = false, onCreateClips = null }) {
+export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUserId, managed = false, socialReady = null, youtubeReady = null, onCreateClips = null }) {
   // Managed (hosted plan): Gemini runs server-side via the bearer token, no BYOK key.
   // Only send X-Gemini-Key for self-host BYOK. apiFetch attaches the bearer token.
   const keyHeader = geminiApiKey ? { 'X-Gemini-Key': geminiApiKey } : {};
   const needsKey = !geminiApiKey && !managed;
+  const canPublish = youtubeReady ?? socialReady ?? (managed || !!(uploadPostKey && uploadUserId));
   // Step management
   const [step, setStep] = useState(0);
   const [mode, setMode] = useState(null); // 'video' or 'manual'
@@ -376,7 +377,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
 
   // --- Publish to YouTube ---
   const handlePublish = async () => {
-    if (!managed && (!uploadPostKey || !uploadUserId)) return alert('Please configure your Upload-Post API key and user in Settings first.');
+    if (!canPublish) return alert('Please configure YouTube publishing in Settings first.');
     const finalTitle = selectedTitle || manualTitle;
     if (!finalTitle) return alert('No title selected.');
     if (!selectedThumbnail) return alert('Please select a thumbnail first.');
@@ -1136,14 +1137,14 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
               </div>
 
               {/* Publish Button */}
-              {(!managed && (!uploadPostKey || !uploadUserId)) ? (
+              {!canPublish ? (
                 <div className="glass-panel p-6 space-y-3">
                   <div className="flex items-center gap-2 text-warn">
                     <AlertCircle size={16} />
-                    <span className="text-sm font-medium lowercase">Upload-Post Not Configured</span>
+                    <span className="text-sm font-medium lowercase">YouTube publishing not configured</span>
                   </div>
                   <p className="text-xs text-muted">
-                    To publish directly to YouTube, configure your Upload-Post API key and connect a profile in Settings.
+                    Add YouTube OAuth credentials to this deployment, then verify the destination in Settings.
                   </p>
                   <button
                     onClick={() => { }}

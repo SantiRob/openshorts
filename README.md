@@ -97,23 +97,23 @@ All generated videos and avatars are saved to a public gallery with SEO pages fo
 5. **Video**: Talking head generation (Hailuo 2.3 Fast img2video + VEED Lipsync)
 6. **B-roll**: AI-generated visuals with Ken Burns effect
 7. **Composite**: FFmpeg final assembly with subtitles and hook overlays
-8. **Publish**: Direct posting to TikTok, Instagram Reels, YouTube Shorts via Upload-Post
+8. **Publish**: Direct posting to YouTube Shorts and Facebook Reels (optional Instagram Reels)
 
 ### YouTube Studio
 - AI-powered title generation with 10 viral options
 - Interactive refinement chat for titles
 - AI thumbnail generation with custom face + background
 - Auto descriptions with chapter timestamps from Whisper transcript
-- Direct YouTube publishing via Upload-Post
+- Direct YouTube publishing with your own Google OAuth token
 
 ### Social Auto-Publishing
-- **One-click posting** to TikTok, Instagram Reels, and YouTube Shorts simultaneously
-- **Schedule uploads** for any date and time — plan your content calendar and let OpenShorts publish automatically
-- **Multi-platform distribution** — publish to all your social networks at once from a single interface
-- Upload-Post integration with async uploads
+- **One-click posting** to YouTube Shorts and Facebook Reels; Instagram Reels is available when a public media URL is configured
+- **YouTube scheduling** for a future date and time
+- **Multi-platform results** — each destination succeeds or fails independently
+- Credentials stay on your server; the dashboard only receives non-secret capability status
 
 ### Infrastructure
-- S3 cloud backup (private bucket for clips, public bucket for gallery/avatars)
+- Local persistent output under `output/` (no object-storage account required)
 - SEO gallery pages served by FastAPI with JSON-LD structured data
 - Shared avatar gallery across all users
 - Async job queue with configurable concurrency
@@ -178,10 +178,10 @@ Self-hosting OpenShorts is free. You provide the machine and you only pay for th
 | **Local LLM (Ollama, LM Studio, vLLM...)** | **Free, your hardware** | $0 | Viral moment detection instead of Gemini (`LLM_BASE_URL`) |
 | **fal.ai** | Pay-per-use | ~$0.50-1.50 per AI Short | Actor generation, talking head video, lip-sync |
 | **ElevenLabs** | Free tier available | Pay-per-use | Voiceover, voice dubbing |
-| **Upload-Post** | **10 free uploads/month** to all networks (no credit card) | Pay-per-use | Auto-publishing to TikTok, Instagram, YouTube |
-| **AWS S3** | Optional | ~$0.023/GB | Cloud backup for clips and gallery |
+| **YouTube Data API / Meta Graph API** | Platform quotas apply | No publishing middleman | Direct publishing to YouTube, Facebook and optional Instagram |
+| **Local disk** | Included | — | Clips, metadata and thumbnails |
 
-**Bottom line:** You can clip videos for practically free with Gemini, and publish 10 videos/month to all social networks at zero cost with Upload-Post.
+**Bottom line:** Bedrock is tried first and Gemini is the fallback (up to three attempts each); publishing goes directly through your YouTube and Meta accounts.
 
 **Don't want to run any of that?** [openshorts.app](https://www.openshorts.app/) is the same software on our hardware: our NVIDIA GPU clips an 8-minute video in about 50 seconds instead of the 5 to 8 minutes it takes on a typical CPU, the Gemini key is included, and auto-publishing is already wired up. Free plan is 20 minutes a month with a watermark and no credit card; paid plans start at $12/mo for 100 minutes without watermark.
 
@@ -190,10 +190,10 @@ Self-hosting OpenShorts is free. You provide the machine and you only pay for th
 ## Requirements
 
 - **Docker & Docker Compose**
-- **Google Gemini API Key** ([Free — get it here](https://aistudio.google.com/app/apikey)) — required for all AI features
+- **AWS Bedrock access and/or a Google Gemini API key** — Bedrock is primary and Gemini is the fallback for clip selection
 - **fal.ai API Key** ([Pay-per-use](https://fal.ai)) — required for AI Shorts (actor generation, video, lip-sync)
 - **ElevenLabs API Key** ([Free tier](https://elevenlabs.io)) — required for voiceover/dubbing
-- **Upload-Post API Key** ([free tier](https://upload-post.com)) — required for direct social posting
+- **YouTube OAuth token and/or Meta Page credentials** — only required for the platforms you publish to
 
 ---
 
@@ -208,7 +208,7 @@ cd openshorts
 ### 2. Configure (optional)
 ```bash
 cp .env.example .env
-# Edit .env with your AWS keys for S3 backup
+# Edit .env with Bedrock/Gemini and direct publishing credentials
 ```
 
 ### 3. Launch
@@ -219,7 +219,7 @@ docker compose up --build
 ### 4. Open Dashboard
 Navigate to **`http://localhost:5175`**
 
-1. Go to **Settings** and enter your API keys (Gemini, fal.ai, ElevenLabs, Upload-Post)
+1. Go to **Settings** to verify the Bedrock → Gemini chain and connected direct-publishing platforms
 2. **Clip Generator**: Upload a long-form video to generate viral shorts
 3. **AI Shorts**: Describe your product or paste a URL to generate UGC marketing videos
 4. **YouTube Studio**: Generate thumbnails, titles, and descriptions for YouTube
@@ -308,11 +308,11 @@ know:
 1. **Ingest** — Local video upload (or self-hosted URL ingest via yt-dlp)
 2. **Transcribe** — faster-whisper with word-level timestamps
 3. **Detect** — PySceneDetect for scene boundaries
-4. **Analyze** — Gemini identifies 3-15 viral moments (15-60s each)
+4. **Analyze** — Bedrock, then Gemini on fallback, identifies 3-15 viral moments (15-60s each)
 5. **Extract** — FFmpeg precise clip cutting
 6. **Reframe** — AI vertical cropping with subject tracking
 7. **Effects** — Subtitles, hooks, AI video effects
-8. **Publish** — S3 backup + Upload-Post social distribution
+8. **Publish** — local retention + direct YouTube distribution
 
 ### AI Shorts
 1. **Analyze** — Website scraping + Gemini web research (or manual description)
@@ -322,8 +322,8 @@ know:
 5. **Video** — Hailuo 2.3 Fast img2video + VEED Lipsync (Low Cost) or Kling Avatar v2 (Premium)
 6. **B-roll** — Flux 2 Pro image generation + Ken Burns effect
 7. **Composite** — FFmpeg assembly with ASS subtitles and hook overlays
-8. **Gallery** — Upload to public S3 with metadata for SEO pages
-9. **Publish** — Upload-Post to TikTok, Instagram, YouTube
+8. **Gallery** — Keep generated media in the local `output/` directory
+9. **Publish** — direct YouTube/Meta publishing
 
 ---
 
@@ -421,26 +421,24 @@ lives in [`examples/n8n/`](examples/n8n/).
 | Backend | Python 3.11, FastAPI, google-genai, faster-whisper, ultralytics (YOLOv8), mediapipe, opencv-python, yt-dlp, FFmpeg, httpx |
 | Frontend | React 18, Vite 4, Tailwind CSS 3.4 |
 | AI APIs | Google Gemini, fal.ai (Flux, Hailuo, VEED, Kling), ElevenLabs |
-| Infrastructure | Docker + Docker Compose, AWS S3 |
-| Publishing | Upload-Post API (TikTok, Instagram, YouTube) |
+| Infrastructure | Docker + Docker Compose, local persistent storage by default |
+| Publishing | YouTube Data API + Meta Graph API |
 
 ---
 
 ## Environment Variables
 
-**Server-side (.env):**
+**Minimal local setup (`.env`):**
 | Variable | Description |
 |----------|------------|
-| `AWS_ACCESS_KEY_ID` | AWS access key for S3 |
-| `AWS_SECRET_ACCESS_KEY` | AWS secret key |
-| `AWS_REGION` | AWS region (default: us-east-1) |
-| `AWS_S3_BUCKET` | Private bucket for clip backup |
-| `AWS_S3_PUBLIC_BUCKET` | Public bucket for gallery/avatars |
-| `MAX_CONCURRENT_JOBS` | Concurrent processing limit (default: 5) |
-| `LLM_BASE_URL` | OpenAI-compatible server for the moment picker (Ollama, vLLM, LM Studio...). Set it and the Gemini key becomes optional |
-| `LLM_MODEL` | Model name on that server (default `llama3.1:8b`) |
-| `LLM_API_KEY` | Bearer token for that server, if it checks one |
-| `LLM_SCORE_BATCH` | Transcript windows per scoring call (default 3 local, 8 Gemini) |
+| `LOCAL_STORAGE_ONLY` | `1` keeps videos and metadata on the local Docker volume and disables S3 |
+| `LLM_FALLBACK_ORDER` | Provider chain (default `bedrock,gemini`) |
+| `AWS_BEARER_TOKEN_BEDROCK` | Development API key created in the Bedrock console |
+| `BEDROCK_ENABLED` | Enables Bedrock when using its API key or an IAM role |
+| `BEDROCK_MODEL_ID` | Bedrock model (default `amazon.nova-lite-v1:0`) |
+| `GEMINI_API_KEY` | Gemini fallback key from Google AI Studio |
+| `YOUTUBE_TOKEN_PATH` | Server path to the YouTube OAuth token JSON |
+| `SOCIAL_PLATFORMS` | Enabled destinations; use `youtube` for the local first run |
 
 **Client-side (encrypted in localStorage):**
 | Key | Description |
@@ -448,7 +446,6 @@ lives in [`examples/n8n/`](examples/n8n/).
 | `GEMINI_API_KEY` | Google Gemini — required unless `LLM_BASE_URL` is set (then only for layout picking and silent videos) |
 | `FAL_KEY` | fal.ai — required for AI Shorts |
 | `ELEVENLABS_API_KEY` | ElevenLabs — required for voiceover/dubbing |
-| `UPLOAD_POST_API_KEY` | Upload-Post — required, for social posting |
 
 ---
 
@@ -463,13 +460,15 @@ lives in [`examples/n8n/`](examples/n8n/).
 
 ---
 
-## Social Media Setup (Upload-Post)
+## Direct Social Media Setup
 
-1. **Register**: [app.upload-post.com/login](https://app.upload-post.com/login)
-2. **Create Profile**: Go to [Manage Users](https://app.upload-post.com/manage-users)
-3. **Connect Accounts**: Link TikTok, Instagram, and/or YouTube
-4. **Get API Key**: Navigate to [API Keys](https://app.upload-post.com/api-keys)
-5. **Use in OpenShorts**: Paste the key in Settings
+1. Follow [`LOCAL_SETUP.md`](LOCAL_SETUP.md) to create the Bedrock, Gemini and YouTube credentials.
+2. Generate `secrets/youtube_token.json` with `youtube_auth.py`.
+3. Keep `SOCIAL_PLATFORMS=youtube` while testing locally.
+4. Restart the backend and check Settings; it reads `/api/social/capabilities` and never exposes credentials.
+
+The old Upload-Post path is only a compatibility escape hatch via
+`SOCIAL_PUBLISH_BACKEND=upload-post`; new self-hosted deployments use `direct`.
 
 ---
 

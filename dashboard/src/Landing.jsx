@@ -575,9 +575,9 @@ export default function Landing({ onLaunchApp }) {
               <div className="w-10 h-10 rounded-input bg-paper3 flex items-center justify-center mb-4">
                 <Globe size={18} className="text-brass" />
               </div>
-              <h3 className="font-display text-xl lowercase text-ink mb-1">Upload-Post API</h3>
-              <div className="mb-3"><span className="badge-ok">Free tier included</span></div>
-              <p className="text-muted text-sm leading-relaxed">Enables direct publishing to YouTube, TikTok, and Instagram Reels from the dashboard. <a href="https://www.upload-post.com" target="_blank" rel="noopener noreferrer" className="text-brass underline hover:brightness-110">Social media API</a> that lets you post your clips and thumbnails without leaving OpenShorts.</p>
+              <h3 className="font-display text-xl lowercase text-ink mb-1">Built-in publishing</h3>
+              <div className="mb-3"><span className="badge-ok">Self-hosted</span></div>
+              <p className="text-muted text-sm leading-relaxed">Publish directly to YouTube Shorts and Meta Reels from the dashboard using credentials owned by your deployment. No separate publishing service account is required.</p>
             </div>
           </div>
           <div className="grid md:grid-cols-2 gap-5 mt-5">

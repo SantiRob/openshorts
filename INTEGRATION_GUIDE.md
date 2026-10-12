@@ -13,7 +13,9 @@ This guide covers deploying two major features added in this release:
 
 Instead of failing when Gemini is unavailable, the system now tries a configurable chain of providers:
 
-**Default order:** Gemini → Claude → DeepSeek → OpenAI → Grok → Amazon Bedrock Nova
+**Default order:** Amazon Bedrock Nova → Gemini, with up to three attempts per provider.
+Claude, DeepSeek, OpenAI and Grok remain available when explicitly added to
+`LLM_FALLBACK_ORDER`.
 
 Each provider is independent; only set API keys for ones you want to use.
 
@@ -26,7 +28,7 @@ Add to `.env` (or pass via Docker):
 ```bash
 # Pick which providers you want to enable:
 
-# Google Gemini (free, default first)
+# Google Gemini (default fallback)
 GEMINI_API_KEY=your_key_here
 
 # Anthropic Claude (cost-effective fallback)
@@ -44,8 +46,11 @@ XAI_API_KEY=your_key_here
 # Amazon Bedrock (uses AWS credentials from IAM role)
 AWS_REGION=us-east-1
 
-# Custom fallback order (optional, default: gemini,claude,deepseek,openai,grok,bedrock-nova)
-LLM_FALLBACK_ORDER=gemini,claude,deepseek,openai
+# Default provider order: Bedrock first, Gemini fallback (3 attempts each)
+LLM_FALLBACK_ORDER=bedrock,gemini
+BEDROCK_MODEL_ID=amazon.nova-lite-v1:0
+BEDROCK_REGION=us-east-1
+GEMINI_MODEL=gemini-3.1-flash-lite
 ```
 
 #### 2. Update Python Dependencies
@@ -79,7 +84,9 @@ docker compose up --build
 | Grok | 2-1212 | $2.00 | $10.00 | Expensive, last resort |
 | Bedrock | Nova Lite | $0.40 | $1.60 | AWS-native, include in bill |
 
-**Recommendation:** Keep Gemini (free) first, add DeepSeek as fallback (~$0.004 per clip detection).
+**Default:** keep Bedrock first while using the AWS trial, with Gemini as the
+fallback. Change `LLM_FALLBACK_ORDER` only when you intentionally want another
+provider in the chain.
 
 ### Monitoring
 

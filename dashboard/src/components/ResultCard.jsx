@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Download, Share2, Instagram, Youtube, Video, AlertCircle, Loader2, Copy, Check, Wand2, Type, Calendar, Languages, FileText, Link2, Scissors, Crosshair, TrendingUp } from 'lucide-react';
+import { Download, Share2, Facebook, Instagram, Youtube, Video, AlertCircle, Loader2, Copy, Check, Wand2, Type, Calendar, Languages, FileText, Link2, Scissors, Crosshair, TrendingUp } from 'lucide-react';
 import { getApiUrl } from '../config';
 import { apiFetch } from '../lib/api';
 import SubtitleModal from './SubtitleModal';
@@ -17,6 +17,7 @@ const QUIET_BTN = 'group flex flex-col items-center justify-center gap-1 py-2.5 
 const PLATFORM_OPTIONS = [
     { value: 'tiktok', label: 'tiktok', icon: <Video size={16} /> },
     { value: 'instagram', label: 'instagram', icon: <Instagram size={16} /> },
+    { value: 'facebook', label: 'facebook reels', icon: <Facebook size={16} /> },
     { value: 'youtube', label: 'youtube', icon: <Youtube size={16} /> },
 ];
 
@@ -36,7 +37,7 @@ function formatDuration(clip) {
     return `${String(Math.floor(secs / 60)).padStart(2, '0')}:${String(secs % 60).padStart(2, '0')}`;
 }
 
-export default function ResultCard({ clip, index, jobId, durable, uploadPostKey, uploadUserId, geminiApiKey, elevenLabsKey, isManaged, onPlay, onPause, onBulkSubtitle, clipCount = 1, bulkProgress, initialState = null, onStateChange, connectedPlatforms = null, onConnectSocials, onEditClip = null, onReframeClip = null }) {
+export default function ResultCard({ clip, index, jobId, durable, uploadPostKey, uploadUserId, geminiApiKey, elevenLabsKey, isManaged, socialReady = null, platformCapabilities = [], onPlay, onPause, onBulkSubtitle, clipCount = 1, bulkProgress, initialState = null, onStateChange, connectedPlatforms = null, onConnectSocials, onEditClip = null, onReframeClip = null }) {
     const [showModal, setShowModal] = useState(false);
     // The "why" line is clamped to two lines so cards in a row stay level;
     // when it overflows, a hover (desktop) or tap (touch) shows the whole
@@ -186,6 +187,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
     const [platforms, setPlatforms] = useState({
         tiktok: true,
         instagram: true,
+        facebook: true,
         youtube: true
     });
     const [postTitle, setPostTitle] = useState("");
@@ -259,14 +261,21 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
     // unknown (profile list not loaded) — in that case nothing is gated.
     const knownConnections = Array.isArray(connectedPlatforms);
     const noAccountsConnected = knownConnections && connectedPlatforms.length === 0;
-    const platformOptions = knownConnections
-        ? PLATFORM_OPTIONS.map((o) => (connectedPlatforms.includes(o.value) ? o : { ...o, disabled: true, hint: 'not connected' }))
-        : PLATFORM_OPTIONS;
+    const capabilityMap = new Map(platformCapabilities.map((item) => [item.id, item]));
+    const platformOptions = PLATFORM_OPTIONS.map((option) => {
+        const capability = capabilityMap.get(option.value);
+        const configured = capabilityMap.size
+            ? capability?.configured !== false && !!capability
+            : !knownConnections || connectedPlatforms.includes(option.value);
+        const schedulable = !isScheduling || capability?.scheduling !== false;
+        return configured && schedulable
+            ? option
+            : { ...option, disabled: true, hint: !configured ? 'not configured' : 'scheduling unavailable' };
+    });
 
     const handleConnectAccounts = () => {
         setShowModal(false);
         if (onConnectSocials) onConnectSocials();
-        else window.open('https://app.upload-post.com', '_blank', 'noopener');
     };
 
     // Initialize/Reset form when modal opens
@@ -282,6 +291,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                 setPlatforms({
                     tiktok: connectedPlatforms.includes('tiktok'),
                     instagram: connectedPlatforms.includes('instagram'),
+                    facebook: connectedPlatforms.includes('facebook'),
                     youtube: connectedPlatforms.includes('youtube'),
                 });
             }
@@ -660,11 +670,11 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
     };
 
     // Managed (cloud plan/trial) users post with the server-side key — no BYOK needed
-    const canPost = isManaged || (uploadPostKey && uploadUserId);
+    const canPost = socialReady ?? (isManaged || !!(uploadPostKey && uploadUserId));
 
     const handlePost = async () => {
         if (!canPost) {
-            setPostResult({ success: false, msg: "Missing API Key or User ID." });
+            setPostResult({ success: false, msg: "No publishing destination is configured." });
             return;
         }
 
@@ -721,6 +731,11 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                 }
             }
 
+            const result = await res.json();
+            if (result.success === false) {
+                const failures = (result.results || []).filter((row) => !row.ok).map((row) => `${row.platform}: ${row.error}`);
+                throw new Error(failures.join('; ') || 'Publishing failed');
+            }
             setPostResult({ success: true, msg: isScheduling ? "Scheduled successfully!" : "Posted successfully!" });
             setTimeout(() => {
                 setShowModal(false);
@@ -1063,7 +1078,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                 {!canPost && (
                     <div className="mb-4 px-3 py-2 rounded-input text-xs text-warn bg-[color-mix(in_oklab,var(--color-warn)_10%,transparent)] flex items-start gap-2">
                         <AlertCircle size={14} className="mt-0.5 shrink-0" />
-                        <div className="lowercase">configure api key in settings first.</div>
+                        <div className="lowercase">configure a publishing destination in settings first.</div>
                     </div>
                 )}
 
@@ -1135,12 +1150,13 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                         <label className="eyebrow block mb-2">PLATFORMS</label>
                         <SegmentedControl
                             multi
-                            columns={3}
+                            columns={2}
                             options={platformOptions}
                             value={Object.keys(platforms).filter(k => platforms[k])}
                             onChange={(arr) => setPlatforms({
                                 tiktok: arr.includes('tiktok'),
                                 instagram: arr.includes('instagram'),
+                                facebook: arr.includes('facebook'),
                                 youtube: arr.includes('youtube'),
                             })}
                         />

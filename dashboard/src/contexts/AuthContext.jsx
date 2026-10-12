@@ -139,6 +139,10 @@ export function AuthProvider({ children }) {
   const value = {
     billingEnabled: config.billingEnabled,
     localLlm: config.localLlm || null,
+    // Deployment-owned integration metadata. Secrets stay on the server; the
+    // dashboard only needs enough information to explain the active fallback
+    // chain and whether publishing destinations are ready.
+    aiProviders: config.aiProviders || config.llmProviders || null,
     googleAuthEnabled: config.googleAuthEnabled,
     jobRetentionSeconds: config.jobRetentionSeconds || null,
     loading,

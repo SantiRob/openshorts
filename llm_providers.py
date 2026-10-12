@@ -6,9 +6,10 @@ Grok, and DeepSeek. Each provider implements the same schema (ScoreResponse,
 DetailResponse) so the rest of the pipeline sees a uniform interface.
 
 Configuration:
-  - LLM_FALLBACK_ORDER: comma-separated provider names (default: gemini,claude,deepseek,openai,grok)
+  - LLM_FALLBACK_ORDER: comma-separated provider names (default: bedrock,gemini)
   - Provider-specific API keys via env vars: GEMINI_API_KEY, ANTHROPIC_API_KEY,
     OPENAI_API_KEY, DEEPSEEK_API_KEY, XAI_API_KEY, AWS_REGION (for Bedrock)
+  - BEDROCK_MODEL_ID and GEMINI_MODEL select each provider's model independently
   - Log which provider ultimately handled each job via logging.info()
 """
 
@@ -20,6 +21,13 @@ from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any, Tuple, List
 
 logger = logging.getLogger(__name__)
+
+# One job can split scoring into several independent batches. If a provider
+# rejects credentials or configuration, retrying it for every batch only adds
+# latency and repeats the same warning. Transient failures still get their full
+# three attempts; deterministic failures open this short process-local circuit.
+_PROVIDER_DISABLED_UNTIL: Dict[str, float] = {}
+_FATAL_PROVIDER_COOLDOWN_SECONDS = 300
 
 
 class ProviderError(Exception):
@@ -365,16 +373,28 @@ class BedrockNovaProvider(BaseProvider):
     """Amazon Bedrock - Amazon Nova Lite (via AWS credentials)."""
 
     def name(self) -> str:
-        return "bedrock-nova"
+        return "bedrock"
 
     def available(self) -> bool:
-        # Bedrock uses AWS credentials from environment or IAM role
-        # No explicit API key needed, but boto3 must be available
+        # Avoid probing EC2 metadata merely to render configuration or choose a
+        # chain. Container/web-identity credentials are discoverable from env;
+        # instance-profile users can opt in explicitly with BEDROCK_ENABLED=1.
         try:
             import boto3
-            return True
         except ImportError:
             return False
+        enabled = (os.getenv("BEDROCK_ENABLED") or "").strip().lower()
+        if enabled in {"1", "true", "yes", "on"}:
+            return True
+        if enabled in {"0", "false", "no", "off"}:
+            return False
+        credential_hints = (
+            "AWS_BEARER_TOKEN_BEDROCK", "AWS_ACCESS_KEY_ID", "AWS_PROFILE",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        )
+        return any((os.getenv(name) or "").strip() for name in credential_hints)
 
     def score(self, prompt: str, model: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Score windows using Amazon Nova on Bedrock."""
@@ -384,23 +404,38 @@ class BedrockNovaProvider(BaseProvider):
         except ImportError:
             raise ProviderError("boto3 not available for Bedrock")
 
-        region = os.getenv("AWS_REGION", "us-east-1")
+        region = (os.getenv("BEDROCK_REGION") or os.getenv("AWS_REGION")
+                  or os.getenv("AWS_DEFAULT_REGION") or "us-east-1")
         client = boto3.client("bedrock-runtime", region_name=region)
 
         model_id = model or "amazon.nova-lite-v1:0"
-        payload = {
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 4096
-        }
+        # Converse is Bedrock's provider-neutral API.  Its content-block shape
+        # is also the native shape expected by Nova; the previous invoke_model
+        # payload used OpenAI-style strings and was rejected by Nova.
+        try:
+            response = client.converse(
+                modelId=model_id,
+                system=[{"text": "Return one JSON object only, with no markdown."}],
+                messages=[{"role": "user", "content": [{"text": prompt}]}],
+                inferenceConfig={"maxTokens": 4096, "temperature": 0.2},
+            )
+        except Exception as exc:
+            message = str(exc)
+            if "AccessDeniedException" in message and "Authentication failed" in message:
+                raise ProviderError(
+                    "AccessDeniedException: Bedrock rejected the API key in region "
+                    f"{region}. Short-term keys are region-scoped and inherit IAM "
+                    "permissions; generate it in this region (or change "
+                    "BEDROCK_REGION) and allow bedrock:CallWithBearerToken."
+                ) from exc
+            raise
 
-        response = client.invoke_model(
-            modelId=model_id,
-            body=json_module.dumps(payload),
-            contentType="application/json"
-        )
-
-        response_body = json_module.loads(response["body"].read())
-        text = response_body.get("content", [{}])[0].get("text", "{}")
+        blocks = (((response.get("output") or {}).get("message") or {})
+                  .get("content") or [])
+        text = "".join(block.get("text", "") for block in blocks
+                       if isinstance(block, dict))
+        if not text.strip():
+            raise ProviderError("Bedrock returned an empty response body")
 
         try:
             parsed = json_module.loads(text)
@@ -415,10 +450,10 @@ class BedrockNovaProvider(BaseProvider):
             else:
                 raise ProviderError("Bedrock returned invalid JSON")
 
-        # Bedrock doesn't return token counts in Nova, estimate or leave as 0
+        usage = response.get("usage") or {}
         cost = {
-            "input_tokens": 0,
-            "output_tokens": 0,
+            "input_tokens": int(usage.get("inputTokens") or 0),
+            "output_tokens": int(usage.get("outputTokens") or 0),
             "total_cost": 0.0,
             "model": model_id
         }
@@ -436,11 +471,16 @@ PROVIDERS = {
     "openai": OpenAIProvider(),
     "deepseek": DeepSeekProvider(),
     "grok": GrokProvider(),
-    "bedrock-nova": BedrockNovaProvider(),
+    "bedrock": BedrockNovaProvider(),
 }
+# Backward-compatible name used by the first multi-provider implementation.
+PROVIDERS["bedrock-nova"] = PROVIDERS["bedrock"]
 
-# Default fallback order: Gemini first (free), then cheaper alternatives
-DEFAULT_FALLBACK_ORDER = "gemini,claude,deepseek,openai,grok,bedrock-nova"
+# Bedrock is the primary provider; Gemini is the intentionally small fallback
+# surface. Extra providers remain opt-in through LLM_FALLBACK_ORDER so existing
+# self-hosted deployments do not lose compatibility.
+DEFAULT_FALLBACK_ORDER = "bedrock,gemini"
+MAX_ATTEMPTS_PER_PROVIDER = 3
 
 
 def get_fallback_chain() -> List[str]:
@@ -449,14 +489,91 @@ def get_fallback_chain() -> List[str]:
     return [p.strip() for p in order.split(",") if p.strip()]
 
 
+def get_model_for_provider(provider_name: str, requested_model: str = "") -> str:
+    """Resolve a model without leaking one provider's model into another.
+
+    ``requested_model`` is retained for the historical Gemini caller. Every
+    other provider uses its own environment variable or safe default.
+    """
+    canonical = "bedrock" if provider_name == "bedrock-nova" else provider_name
+    env_names = {
+        "bedrock": ("BEDROCK_MODEL_ID", "BEDROCK_MODEL", "LLM_BEDROCK_MODEL"),
+        "gemini": ("GEMINI_MODEL", "LLM_GEMINI_MODEL"),
+        "claude": ("ANTHROPIC_MODEL", "LLM_CLAUDE_MODEL"),
+        "openai": ("OPENAI_MODEL", "LLM_OPENAI_MODEL"),
+        "deepseek": ("DEEPSEEK_MODEL", "LLM_DEEPSEEK_MODEL"),
+        "grok": ("XAI_MODEL", "LLM_GROK_MODEL"),
+    }
+    for env_name in env_names.get(canonical, ()):
+        value = (os.getenv(env_name) or "").strip()
+        if value:
+            return value
+    if canonical == "gemini" and requested_model:
+        return requested_model
+    defaults = {
+        "gemini": "gemini-3.1-flash-lite",
+        "claude": "claude-3-5-haiku-latest",
+        "openai": "gpt-4o-mini",
+        "deepseek": "deepseek-chat",
+        "grok": "grok-2-1212",
+        "bedrock": "amazon.nova-lite-v1:0",
+    }
+    return defaults.get(canonical, "")
+
+
+def describe_configuration() -> Dict[str, Any]:
+    """Non-secret provider state suitable for ``/api/config`` and a UI."""
+    chain = get_fallback_chain()
+    return {
+        "fallbackOrder": chain,
+        "maxAttemptsPerProvider": MAX_ATTEMPTS_PER_PROVIDER,
+        "providers": [
+            {
+                "name": name,
+                "model": get_model_for_provider(name),
+                "available": bool(PROVIDERS.get(name) and PROVIDERS[name].available()),
+            }
+            for name in chain
+        ],
+    }
+
+
+def _retryable(exc: Exception) -> bool:
+    """Whether another call can plausibly succeed without configuration changes."""
+    # Gemini policy blocks and ordinary 4xx errors are deterministic. Invalid
+    # or truncated model JSON is retried because it commonly changes per call.
+    try:
+        import gemini_worker
+        if isinstance(exc, gemini_worker.GeminiBlockedError):
+            return False
+    except ImportError:
+        pass
+    msg = str(exc).lower()
+    fatal_tokens = ("invalid_argument", "accessdenied", "unauthorized", "forbidden",
+                    "no credentials", "unrecognizedclient", "validationexception")
+    if any(token in msg for token in fatal_tokens):
+        return False
+    retryable_tokens = (
+        "429", "500", "502", "503", "504", "unavailable", "throttl",
+        "resource_exhausted", "overloaded", "deadline", "timeout", "connection",
+        "empty response", "did not contain a json object", "failed to parse",
+        "invalid json", "validation error", "internal",
+    )
+    return any(token in msg for token in retryable_tokens)
+
+
 def call_with_fallback(
     callback,
     model_name: str,
-    stage_label: str = "stage"
+    stage_label: str = "stage",
+    force_available: Optional[List[str]] = None,
+    raise_last: bool = False,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], str]:
     """
     Call callback(provider, model_name) across fallback chain until success.
-    Returns (parsed_response, cost_analysis, provider_name) or (None, None, "") on failure.
+    Returns (parsed_response, cost_analysis, provider_name) or (None, None, "")
+    on failure. With ``raise_last=True``, preserves the final provider exception
+    (used by the pipeline for policy-block and diagnostic compatibility).
 
     callback: function(provider: BaseProvider, model: str) -> (parsed, cost)
     model_name: the model to request from each provider
@@ -464,6 +581,8 @@ def call_with_fallback(
     """
     chain = get_fallback_chain()
     errors = []
+    last_exception = None
+    forced = set(force_available or [])
 
     for provider_name in chain:
         if provider_name not in PROVIDERS:
@@ -471,32 +590,44 @@ def call_with_fallback(
             continue
 
         provider = PROVIDERS[provider_name]
-        if not provider.available():
+        disabled_until = _PROVIDER_DISABLED_UNTIL.get(provider_name, 0)
+        if provider_name not in forced and disabled_until > time.monotonic():
+            logger.info(
+                "Skipping %s for %s after a fatal configuration/authentication error",
+                provider_name, stage_label)
+            continue
+        if provider_name not in forced and not provider.available():
             logger.debug(f"Provider {provider_name} not available (missing API key?), skipping")
             continue
 
-        try:
-            logger.info(f"Trying {provider_name} for {stage_label}...")
-            parsed, cost = callback(provider, model_name)
-            logger.info(f"✅ {provider_name} succeeded for {stage_label}")
-            return parsed, cost, provider_name
-        except Exception as e:
-            error_msg = str(e)[:200]
-            logger.warning(f"❌ {provider_name} failed for {stage_label}: {error_msg}")
-            errors.append(f"{provider_name}: {error_msg}")
+        provider_model = get_model_for_provider(provider_name, model_name)
+        for attempt in range(1, MAX_ATTEMPTS_PER_PROVIDER + 1):
+            try:
+                logger.info("Trying %s for %s (attempt %s/%s, model=%s)",
+                            provider_name, stage_label, attempt,
+                            MAX_ATTEMPTS_PER_PROVIDER, provider_model)
+                parsed, cost = callback(provider, provider_model)
+                logger.info("✅ %s succeeded for %s", provider_name, stage_label)
+                return parsed, cost, provider_name
+            except Exception as e:
+                last_exception = e
+                error_msg = str(e)[:200]
+                errors.append(f"{provider_name}[{attempt}]: {error_msg}")
+                logger.warning("❌ %s failed for %s (%s/%s): %s",
+                               provider_name, stage_label, attempt,
+                               MAX_ATTEMPTS_PER_PROVIDER, error_msg)
+                retryable = _retryable(e)
+                if not retryable:
+                    _PROVIDER_DISABLED_UNTIL[provider_name] = (
+                        time.monotonic() + _FATAL_PROVIDER_COOLDOWN_SECONDS
+                    )
+                if attempt == MAX_ATTEMPTS_PER_PROVIDER or not retryable:
+                    break
+                # Keep tests fast via monkeypatch and production gentle on
+                # throttled APIs. Two waits means exactly three total attempts.
+                time.sleep(5 * (2 ** (attempt - 1)))
 
     logger.error(f"All providers exhausted for {stage_label}. Errors: {'; '.join(errors)}")
+    if raise_last and last_exception is not None:
+        raise last_exception
     return None, None, ""
-
-
-def get_model_for_provider(provider_name: str) -> str:
-    """Get the default model name for a provider."""
-    defaults = {
-        "gemini": "gemini-3.1-flash-lite",
-        "claude": "claude-3-5-haiku-latest",
-        "openai": "gpt-4o-mini",
-        "deepseek": "deepseek-chat",
-        "grok": "grok-2-1212",
-        "bedrock-nova": "amazon.nova-lite-v1:0",
-    }
-    return defaults.get(provider_name, "")
